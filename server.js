@@ -109,8 +109,13 @@ const server = http.createServer((req, res) => {
 
 function readJSON(req, cb) {
   let data = '';
-  req.on('data', c => data += c);
-  req.on('end', () => { try { cb(JSON.parse(data)); } catch (e) { cb({}); } });
+  let aborted = false;
+  req.on('data', c => {
+    if (aborted) return;
+    data += c;
+    if (data.length > 8 * 1024 * 1024) { aborted = true; cb({ _tooLarge: true }); req.destroy(); }
+  });
+  req.on('end', () => { if (aborted) return; try { cb(JSON.parse(data)); } catch (e) { cb({}); } });
 }
 function json(res, code, body, cors) {
   res.writeHead(code, { ...cors, 'Content-Type': 'application/json' });
@@ -143,6 +148,16 @@ wss.on('connection', ws => {
       ws.send(JSON.stringify({ type: 'auth-ok' }));
       const list = Object.values(db.users).map(publicUser);
       ws.send(JSON.stringify({ type: 'userlist', users: list }));
+      const myMessages = {};
+      const favK = '__fav__::' + username;
+      if (db.messages[favK]) myMessages[favK] = db.messages[favK];
+      for (const k of Object.keys(db.messages)) {
+        if (k.includes('::') && k !== favK && !k.startsWith('group::')) {
+          const parts = k.split('::');
+          if (parts.includes(username)) myMessages[k] = db.messages[k];
+        }
+      }
+      ws.send(JSON.stringify({ type: 'history', messages: myMessages }));
       const myGroups = Object.values(db.groups).filter(g => g.members.includes(username));
       ws.send(JSON.stringify({ type: 'groups', groups: myGroups }));
       const groupMsgs = {};
@@ -227,14 +242,15 @@ wss.on('connection', ws => {
     }
 
     if (msg.type === 'group-create') {
-      const id = 'g_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+      const id = (msg.id && /^g_[a-z0-9_]+$/.test(msg.id)) ? msg.id : ('g_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7));
       const name = String(msg.name || 'Group').slice(0, 50);
       const members = Array.from(new Set([username, ...(msg.members || []).slice(0, 200)]));
       db.groups[id] = {
         id, name, members,
-        admins: { [username]: { tag: '' } },
+        admins: { [username]: { tag: '', perms: { edit: true, kick: true, addAdmin: true, delete: true, editMsgs: true } } },
         owner: username,
         avatar: msg.avatar || null,
+        requests: {},
         createdAt: Date.now()
       };
       save();
@@ -247,15 +263,41 @@ wss.on('connection', ws => {
       if (!g.members.includes(username)) return;
       const add = String(msg.user || '').toLowerCase();
       if (!db.users[add] || g.members.includes(add)) return;
+      const targetUser = db.users[add];
+      const requiresReq = targetUser.privacy && targetUser.privacy.friendsOnly;
+      if (requiresReq) {
+        g.requests = g.requests || {};
+        if (g.requests[add]) return;
+        g.requests[add] = { by: username, ts: Date.now() };
+        save();
+        sendTo(add, { type: 'group-request', group: { id: g.id, name: g.name, avatar: g.avatar }, by: username });
+        sendTo(username, { type: 'toast', text: 'Запрос отправлен' });
+        return;
+      }
       g.members.push(add);
       save();
       const payload = { type: 'group-info', group: g };
       for (const m of g.members) sendTo(m, payload);
     }
 
+    if (msg.type === 'group-req-accept') {
+      const g = db.groups[msg.id]; if (!g) return;
+      if (!g.requests || !g.requests[username]) return;
+      delete g.requests[username];
+      if (!g.members.includes(username)) g.members.push(username);
+      save();
+      const payload = { type: 'group-info', group: g };
+      for (const m of g.members) sendTo(m, payload);
+    }
+    if (msg.type === 'group-req-decline') {
+      const g = db.groups[msg.id]; if (!g) return;
+      if (g.requests && g.requests[username]) { delete g.requests[username]; save(); }
+    }
+
     if (msg.type === 'group-remove') {
       const g = db.groups[msg.id]; if (!g) return;
-      if (!g.admins[username]) return;
+      const a = g.admins[username];
+      if (!a || !(username === g.owner || (a.perms && a.perms.kick))) return;
       const rem = String(msg.user || '').toLowerCase();
       if (rem === g.owner) return;
       g.members = g.members.filter(x => x !== rem);
@@ -279,13 +321,49 @@ wss.on('connection', ws => {
 
     if (msg.type === 'group-admin') {
       const g = db.groups[msg.id]; if (!g) return;
-      if (username !== g.owner) return;
+      const a = g.admins[username];
+      const canAdmin = username === g.owner || (a && a.perms && a.perms.addAdmin);
+      if (!canAdmin) return;
       const target = String(msg.user || '').toLowerCase();
       if (!g.members.includes(target)) return;
-      if (msg.add) g.admins[target] = { tag: String(msg.tag || '').slice(0, 10) };
-      else if (target !== g.owner) delete g.admins[target];
+      if (msg.add) {
+        const perms = msg.perms || { edit: false, kick: false, addAdmin: false, delete: false, editMsgs: false };
+        g.admins[target] = { tag: String(msg.tag || '').slice(0, 10), perms };
+      } else if (target !== g.owner) delete g.admins[target];
       save();
       const payload = { type: 'group-info', group: g };
+      for (const m of g.members) sendTo(m, payload);
+    }
+
+    if (msg.type === 'group-edit') {
+      const g = db.groups[msg.id]; if (!g) return;
+      const a = g.admins[username];
+      if (!(username === g.owner || (a && a.perms && a.perms.edit))) return;
+      if (typeof msg.name === 'string' && msg.name.trim()) g.name = msg.name.slice(0, 50);
+      if (typeof msg.avatar !== 'undefined') g.avatar = msg.avatar || null;
+      save();
+      const payload = { type: 'group-info', group: g };
+      for (const m of g.members) sendTo(m, payload);
+    }
+
+    if (msg.type === 'group-delete') {
+      const g = db.groups[msg.id]; if (!g) return;
+      const a = g.admins[username];
+      if (!(username === g.owner || (a && a.perms && a.perms.delete))) return;
+      const mems = [...g.members];
+      delete db.groups[g.id];
+      delete db.messages['group::' + g.id];
+      save();
+      for (const m of mems) sendTo(m, { type: 'group-kicked', id: g.id });
+    }
+
+    if (msg.type === 'group-clear') {
+      const g = db.groups[msg.id]; if (!g) return;
+      const a = g.admins[username];
+      if (!(username === g.owner || a)) return;
+      db.messages['group::' + g.id] = [];
+      save();
+      const payload = { type: 'group-clear', id: g.id };
       for (const m of g.members) sendTo(m, payload);
     }
 
